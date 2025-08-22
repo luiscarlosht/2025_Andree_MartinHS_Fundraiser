@@ -5,11 +5,11 @@ import os
 
 app = Flask(__name__)
 
-# Load credentials from environment variables
+# Load environment variables
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_SMS_NUMBER = os.getenv("TWILIO_SMS_NUMBER")  # e.g. +12292354360
-TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")  # e.g. whatsapp:+12292354360
+TWILIO_SMS_NUMBER = os.getenv("TWILIO_SMS_NUMBER")
+TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
@@ -20,10 +20,8 @@ def sms_reply():
     incoming_msg = request.values.get('Body', '').strip()
     from_number = request.values.get('From', '')
     
-    # Generate GPT response
     gpt_response = get_gpt_response(incoming_msg)
 
-    # Send SMS back
     client.messages.create(
         body=gpt_response,
         from_=TWILIO_SMS_NUMBER,
@@ -37,10 +35,8 @@ def whatsapp_reply():
     incoming_msg = request.values.get('Body', '').strip()
     from_number = request.values.get('From', '')
     
-    # Generate GPT response
     gpt_response = get_gpt_response(incoming_msg)
 
-    # Send WhatsApp reply
     client.messages.create(
         body=gpt_response,
         from_=TWILIO_WHATSAPP_NUMBER,
@@ -51,11 +47,11 @@ def whatsapp_reply():
 
 def get_gpt_response(prompt):
     response = openai.ChatCompletion.create(
-        model="gpt-4",  # or gpt-4o-mini for cost efficiency
+        model="gpt-5",  # ✅ GPT-5
         messages=[{"role": "user", "content": prompt}],
         temperature=0.7
     )
     return response['choices'][0]['message']['content']
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=True)
