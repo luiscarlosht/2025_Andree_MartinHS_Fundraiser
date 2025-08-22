@@ -1,57 +1,41 @@
 from flask import Flask, request
-from twilio.rest import Client
+from twilio.twiml.messaging_response import MessagingResponse
 import openai
 import os
 
+# Load environment variables (replace with your actual keys or use dotenv)
+openai.api_key = os.getenv("OPENAI_API_KEY")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+
 app = Flask(__name__)
 
-# Load environment variables
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_SMS_NUMBER = os.getenv("TWILIO_SMS_NUMBER")
-TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-openai.api_key = OPENAI_API_KEY
-
-@app.route("/sms", methods=['POST'])
-def sms_reply():
-    incoming_msg = request.values.get('Body', '').strip()
-    from_number = request.values.get('From', '')
-    
-    gpt_response = get_gpt_response(incoming_msg)
-
-    client.messages.create(
-        body=gpt_response,
-        from_=TWILIO_SMS_NUMBER,
-        to=from_number
-    )
-
-    return "OK", 200
-
-@app.route("/whatsapp", methods=['POST'])
+@app.route("/whatsapp", methods=["POST"])
 def whatsapp_reply():
-    incoming_msg = request.values.get('Body', '').strip()
-    from_number = request.values.get('From', '')
-    
-    gpt_response = get_gpt_response(incoming_msg)
+    incoming_msg = request.form.get("Body")  # WhatsApp message text
+    sender = request.form.get("From")       # WhatsApp sender
 
-    client.messages.create(
-        body=gpt_response,
-        from_=TWILIO_WHATSAPP_NUMBER,
-        to=from_number
-    )
+    print(f"Message from {sender}: {incoming_msg}")
 
-    return "OK", 200
+    # Generate GPT-5 response
+    try:
+        completion = openai.ChatCompletion.create(
+            model="gpt-5",  # Make sure you have GPT-5 access
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant for fundraising."},
+                {"role": "user", "content": incoming_msg}
+            ]
+        )
+        gpt_response = completion['choices'][0]['message']['content'].strip()
+    except Exception as e:
+        gpt_response = f"Error generating response: {str(e)}"
 
-def get_gpt_response(prompt):
-    response = openai.ChatCompletion.create(
-        model="gpt-5",  # ✅ GPT-5
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.7
-    )
-    return response['choices'][0]['message']['content']
+    # Respond to WhatsApp
+    resp = MessagingResponse()
+    msg = resp.message()
+    msg.body(gpt_response)
+
+    return str(resp)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
