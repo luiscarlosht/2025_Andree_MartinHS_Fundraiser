@@ -53,7 +53,6 @@ def ask_openai(prompt: str, max_retries: int = 2) -> str:
                 resp = client.responses.create(
                     model=model,
                     input=prompt,
-                    temperature=0.6,
                 )
                 text = (resp.output_text or "").strip()
                 if not text:
