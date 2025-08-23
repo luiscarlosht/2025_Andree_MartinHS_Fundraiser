@@ -1,46 +1,62 @@
 import os
-from flask import Flask, request
-from twilio.twiml.messaging_response import MessagingResponse
+import time
+import logging
 from openai import OpenAI
+from openai import APIError, RateLimitError, APITimeoutError
 
-# Load environment variables
+# Ensure logging goes to your systemd log file
+logging.basicConfig(level=logging.INFO)
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM")
-WHATSAPP_TO = os.getenv("WHATSAPP_TO")
-
-if not OPENAI_API_KEY:
-    raise ValueError("Missing OpenAI API key! Set OPENAI_API_KEY as an environment variable.")
-
-# Initialize OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-app = Flask(__name__)
+PRIMARY_MODEL = os.getenv("OPENAI_PRIMARY_MODEL", "gpt-5")
+FALLBACK_MODEL = os.getenv("OPENAI_FALLBACK_MODEL", "gpt-5-mini")
 
-@app.route("/whatsapp", methods=["POST"])
-def whatsapp_reply():
-    incoming_msg = request.values.get("Body", "").strip()
-    response = MessagingResponse()
-    msg = response.message()
+def ask_openai(prompt: str, max_retries: int = 2) -> str:
+    """
+    Try PRIMARY_MODEL, then FALLBACK_MODEL on failure.
+    Uses lightweight retries for transient errors.
+    Returns plain text. Raises last exception if everything fails.
+    """
+    models_to_try = [PRIMARY_MODEL, FALLBACK_MODEL]
+    last_err = None
 
-    if incoming_msg:
-        try:
-            # Send to GPT-5 model
-            ai_response = client.responses.create(
-                model="gpt-5",
-                input=incoming_msg
-            )
+    for model in models_to_try:
+        for attempt in range(1, max_retries + 1):
+            try:
+                logging.info(f"[OpenAI] Using model={model}, attempt={attempt}")
+                resp = client.responses.create(
+                    model=model,
+                    input=prompt,
+                    temperature=0.7,
+                )
+                text = resp.output_text.strip()
+                if not text:
+                    raise APIError("Empty response text")
+                if model != PRIMARY_MODEL:
+                    logging.warning(f"[OpenAI] FELL BACK to {model} and succeeded.")
+                return text
 
-            bot_reply = ai_response.output_text.strip()
-            msg.body(bot_reply)
+            except (RateLimitError, APITimeoutError) as e:
+                # transient — brief backoff then retry (or switch models)
+                backoff = 1.5 ** attempt
+                logging.warning(f"[OpenAI] Transient error on {model}: {e}. Backing off {backoff:.1f}s")
+                time.sleep(backoff)
+                last_err = e
+                continue
 
-        except Exception as e:
-            msg.body(f"Error: {str(e)}")
-    else:
-        msg.body("Hi! Please send a message to get started.")
+            except APIError as e:
+                # hard API error (includes insufficient_quota)
+                logging.error(f"[OpenAI] API error on {model}: {e}. Will try fallback if available.")
+                last_err = e
+                break  # break retry loop and move to next model
 
-    return str(response)
+            except Exception as e:
+                # catch-all to avoid crashing webhook
+                logging.exception(f"[OpenAI] Unexpected error on {model}: {e}")
+                last_err = e
+                break
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    # If we got here, both models failed
+    raise last_err or RuntimeError("OpenAI call failed without specific exception.")
