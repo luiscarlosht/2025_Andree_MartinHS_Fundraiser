@@ -14,7 +14,7 @@ logging.basicConfig(
 )
 
 # ----- Config / Env -----
-FUNDRAISER_URL = os.getenv("FUNDRAISER_URL", "https://vraise.org/sNQil1")
+FUNDRAISER_URL = os.getenv("FUNDRAISER_URL", "https://app.verticalraise.com/donationV3/?fundraiser_id=539208&uid=1813100")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
