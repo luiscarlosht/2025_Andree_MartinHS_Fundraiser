@@ -13,7 +13,7 @@ from twilio.twiml.messaging_response import MessagingResponse
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # ---------- Config / Env ----------
-FUNDRAISER_URL = os.getenv("FUNDRAISER_URL", "https://app.verticalraise.com/donationV3/?fundraiser_id=539208&uid=1813100")
+FUNDRAISER_URL = os.getenv("FUNDRAISER_URL", "https://bit.ly/AndreeBand")
 GOAL_USD = os.getenv("GOAL_USD", "1000")              # e.g., "1000"
 DEADLINE = os.getenv("DEADLINE", "")                  # e.g., "2025-09-30" (YYYY-MM-DD) or ""
 PRIMARY_MODEL = os.getenv("OPENAI_PRIMARY_MODEL", "gpt-5")
