@@ -1,188 +1,183 @@
 #!/usr/bin/env python3
-import csv, re, sys, unicodedata
+import csv, re, sys
+from collections import OrderedDict
 from pathlib import Path
 
-INFILE  = str(Path.home() / "contacts_raw.tsv")
-OUTFILE = str(Path.home() / "contacts_clean_for_whatsapp.csv")
+# ------- TWEAKABLE -------
+DEFAULT_US_CC = "+1"
+DEFAULT_MX_CC = "+52"
+ADD_MX_MOBILE_ONE = False   # rarely needed
+INFILE  = str(Path.home() / "contacts_raw.tsv")   # or pass via argv[1]
+OUTFILE = str(Path.home() / "contacts_clean_for_whatsapp.csv")  # or argv[2]
+# -------------------------
 
-# Basic helpers
-def strip_accents(s):
-    try:
-        return ''.join(c for c in unicodedata.normalize('NFKD', s) if not unicodedata.combining(c))
-    except Exception:
-        return s
+PHONE_COLS = [
+    "Phone 1 - Value","Phone 2 - Value","Phone 3 - Value",
+    "Phone 4 - Value","Phone 5 - Value","Phone 6 - Value"
+]
+LABEL_COLS = [
+    "Phone 1 - Label","Phone 2 - Label","Phone 3 - Label",
+    "Phone 4 - Label","Phone 5 - Label","Phone 6 - Label"
+]
 
-def normalize_name(s):
-    s = (s or "").strip()
-    s = re.sub(r"\s+", " ", s)
-    return s
+# Regexes to find possible phones inside messy text:
+RE_E164 = re.compile(r"\+\d{8,15}")
+RE_US_10_11 = re.compile(r"(?<!\d)(1?\d{10})(?!\d)")
+RE_MX_12_13 = re.compile(r"(?<!\d)(52\d{10}|521\d{10})(?!\d)")
 
-# Pull only digits, keep leading '+'
-def digits_plus(s):
-    s = s or ""
-    s = s.strip()
-    s = s.replace("—", "-")
-    s = s.replace("–", "-")
-    s = s.replace("—", "-")
-    # keep + and digits only
-    return re.sub(r"(?!^\+)[^\d]", "", s)
+def only_digits(s: str) -> str:
+    return "".join(ch for ch in s if ch.isdigit())
 
-# Split concatenated phone numbers:
-# Examples seen:
-#   +1817307051518175648524   -> two US numbers stuck together
-#   +21420774072142077407     -> two 11/10-digit sequences smashed
-#   12144777343               -> valid US
-# Strategy:
-#  - If there is a '+' inside: split at every '+'
-#  - Else, greedily extract all 10-15 digit sequences
-def split_phones(raw):
-    s = (raw or "").strip()
-    if not s:
-        return []
-    # Normalize separators to spaces
-    s = s.replace(":::", " ").replace("/", " ").replace("\\", " ")
-    # If we see multiple '+', split
-    if s.count('+') > 1:
-        parts = [p.strip() for p in re.split(r"\s*\+\s*", s)]
-        parts = ["+"+p for p in parts if p]
-    else:
-        parts = [s]
+def normalize_phone(raw: str):
+    """
+    Return (e164, country) or (None, None).
+    Handles +E.164, US national (10 or 11 with leading 1), and MX 52/521 + 10.
+    """
+    if not raw: return None, None
+    s = raw.strip()
 
-    numbers = []
-    for p in parts:
-        p = p.strip()
-        if not p:
-            continue
-        # If it has a '+', keep only + and digits
-        if p.startswith('+'):
-            p = '+' + re.sub(r"\D", "", p[1:])
-            if len(p) >= 5:
-                numbers.append(p)
-        else:
-            # No plus: extract long digit runs (10-15)
-            for m in re.finditer(r"\d{10,15}", p):
-                numbers.append(m.group(0))
-    return numbers
+    # Already E.164?
+    if s.startswith("+"):
+        d = only_digits(s)
+        if len(d) < 8: return None, None
+        if d.startswith("1"):
+            return "+"+d, "US"
+        if d.startswith("52"):
+            local = d[2:]
+            if ADD_MX_MOBILE_ONE and not d.startswith("521") and len(local)==10:
+                return "+521"+local, "MX"
+            return "+"+d, "MX"
+        return "+"+d, "INTL"
 
-# Normalize to E.164 for a couple of common cases
-def to_e164(n):
-    n = n.strip()
-    if not n: return None
-    # Already looks like E.164
-    if n.startswith('+'):
-        return n
-    # Assume US if 10 or 11 starting with '1'
-    if re.fullmatch(r"\d{10}", n):
-        return "+1" + n
-    if re.fullmatch(r"1\d{10}", n):
-        return "+" + n
-    # Mexico often provided with +52 already; if 13 digits starting with 52:
-    if re.fullmatch(r"52\d{10,12}", n):
-        return "+" + n
-    # fall back: prefix + if 11-15 digits
-    if re.fullmatch(r"\d{11,15}", n):
-        return "+" + n
-    return None
+    d = only_digits(s)
+    if not d: return None, None
 
-def infer_country(e164):
-    if not e164: return ""
-    if e164.startswith("+1"): return "US"
-    if e164.startswith("+52"): return "MX"
-    return "INTL"
+    # MX 52/521 + 10 digits
+    if (d.startswith("52") and len(d) in (12,13)):
+        local = d[2:]
+        if ADD_MX_MOBILE_ONE and not d.startswith("521") and len(local)==10:
+            return "+521"+local, "MX"
+        return "+"+d, "MX"
 
-def is_likely_mobile(e164):
-    # Heuristic only; WhatsApp generally works with E.164 for mobiles.
-    # We won’t try carrier DB; just accept for +1/+52.
-    return e164.startswith("+1") or e164.startswith("+52") or e164.startswith("+5") or e164.startswith("+2") or e164.startswith("+3") or e164.startswith("+4") or e164.startswith("+6") or e164.startswith("+7") or e164.startswith("+8") or e164.startswith("+9")
+    # US national
+    if len(d)==11 and d.startswith("1"):
+        return DEFAULT_US_CC + d[1:], "US"
+    if len(d)==10:
+        return DEFAULT_US_CC + d, "US"
 
-# Try reading tab-delimited first, then CSV as a fallback
+    # Generic INTL if looks long enough
+    if len(d) >= 8:
+        return "+"+d, "INTL"
+    return None, None
+
+def extract_phone_candidates(text: str):
+    """
+    From a messy string, extract multiple phone-like chunks.
+    Prioritize explicit +E.164, then MX (52/521...), then US 10/11-digit.
+    Also split on obvious separators (commas, slashes, :::, pipes).
+    """
+    if not text: return []
+
+    pieces = re.split(r"[,\|/;:\t]|:::|\s{2,}", text)
+    raw_hits = []
+
+    # 1) Gather explicit +E.164
+    raw_hits += RE_E164.findall(text)
+
+    # 2) MX style 52/521 + 10
+    raw_hits += RE_MX_12_13.findall(text)
+
+    # 3) US 10/11 contiguous digits
+    raw_hits += RE_US_10_11.findall(text)
+
+    # 4) Also scan each piece for loose phones (keeps (xxx) yyy-zzzz forms)
+    LOOSE = re.compile(r"\+?\d[\d\-\s\(\)\.]{6,}\d")
+    for p in pieces:
+        raw_hits += LOOSE.findall(p)
+
+    # Normalize & uniquify preserving order
+    seen = set()
+    out = []
+    for h in raw_hits:
+        e164, country = normalize_phone(h)
+        if e164 and e164 not in seen:
+            seen.add(e164)
+            out.append((e164, country))
+    return out
+
+def pick_best_number(row):
+    """
+    Prefer numbers from columns whose label contains Mobile/Cell/Móvil.
+    If multiple found in a single cell, take the first valid after normalization.
+    """
+    mobile_keywords = ("mobile","cell","móvil","m\u00f3vil")  # cover accents
+    best = None
+
+    # First pass: look for mobile-labelled columns
+    for i, col in enumerate(PHONE_COLS):
+        val = (row.get(col, "") or "").strip()
+        if not val: continue
+        label = (row.get(LABEL_COLS[i], "") or "").lower()
+        cands = extract_phone_candidates(val)
+        if not cands: continue
+        if any(k in label for k in mobile_keywords):
+            return cands[0]  # (e164, country)
+        if best is None:
+            best = cands[0]
+
+    return best if best else (None, None)
+
+def full_name(row):
+    first = (row.get("First Name","") or "").strip()
+    last  = (row.get("Last Name","")  or "").strip()
+    nick  = (row.get("Nickname","")   or "").strip()
+    name = " ".join(x for x in [first, last] if x)
+    if not name and nick:
+        name = nick
+    if not name:
+        name = (row.get("Organization Name","") or "").strip() or (row.get("E-mail 1 - Value","") or "").strip()
+    return name or "Unknown"
+
 def read_rows(path):
+    # Read TSV/CSV with forgiving dialect
     text = Path(path).read_text(encoding="utf-8", errors="ignore")
-    # Decide delimiter by header
-    header_line = text.splitlines()[0] if text else ""
-    if header_line.count("\t") >= 2:
-        dialect = "excel-tab"
-    else:
-        dialect = "excel"
-
-    f = Path(path).open("r", encoding="utf-8", errors="ignore", newline="")
-    rdr = csv.DictReader(f, dialect=dialect)
-    rows = list(rdr)
-    f.close()
+    # guess delimiter by header
+    delim = "\t" if "\t" in text.splitlines()[0] else ","
+    rows = []
+    for row in csv.DictReader(text.splitlines(), delimiter=delim):
+        rows.append(row)
     return rows
 
 def main():
-    rows = read_rows(INFILE)
+    in_path  = sys.argv[1] if len(sys.argv) > 1 else INFILE
+    out_path = sys.argv[2] if len(sys.argv) > 2 else OUTFILE
 
-    # Try to map probable column names (case-insensitive)
-    def find_col(name_opts):
-        lower_map = {k.lower(): k for k in rows[0].keys()} if rows else {}
-        for o in name_opts:
-            if o.lower() in lower_map:
-                return lower_map[o.lower()]
-        return None
+    rows = read_rows(in_path)
+    out_rows = []
+    seen = set()
 
-    name_col  = find_col(["Name", "Full Name", "First Name", "File As"])
-    phone_col = find_col(["Phone", "Phone 1 - Value", "Mobile", "Primary Phone"])
-    chan_col  = find_col(["Channel"])
-    country_col = find_col(["Country"])
-    optin_col = find_col(["OptIn", "Opt In", "Opt-in"])
+    for row in rows:
+        name = full_name(row)
+        phone, country = pick_best_number(row)
+        if not phone: continue
+        if phone in seen: continue
+        seen.add(phone)
 
-    cleaned = []
-    seen_numbers = set()
+        channel = "WhatsApp" if country in ("US","MX","INTL") else "WhatsApp"
+        out_rows.append(OrderedDict([
+            ("Name", name),
+            ("Phone_E164", phone),
+            ("Country", country or ""),
+            ("Channel", channel),
+            ("OptIn", "")
+        ]))
 
-    for r in rows:
-        raw_name  = normalize_name(strip_accents(r.get(name_col, "") if name_col else ""))
-        raw_phone = r.get(phone_col, "") if phone_col else ""
-        raw_chan  = (r.get(chan_col, "") if chan_col else "WhatsApp") or "WhatsApp"
-        raw_country = (r.get(country_col, "") if country_col else "").strip().upper()
-        raw_optin = (r.get(optin_col, "") if optin_col else "").strip()
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["Name","Phone_E164","Country","Channel","OptIn"])
+        writer.writeheader()
+        writer.writerows(out_rows)
 
-        # Split phones and normalize each
-        candidates = []
-        for piece in split_phones(raw_phone):
-            dp = digits_plus(piece)
-            if not dp: continue
-            candidates.append(dp)
-
-        if not candidates:
-            # Skip rows with no usable phone
-            continue
-
-        for cand in candidates:
-            e164 = to_e164(cand)
-            if not e164: 
-                continue
-            if not is_likely_mobile(e164):
-                continue
-            # De-dup on number
-            if e164 in seen_numbers:
-                continue
-            seen_numbers.add(e164)
-
-            country = infer_country(e164)
-            channel = "WhatsApp"  # we’re prepping for WA
-            optin   = raw_optin or ""  # leave blank if unknown
-
-            cleaned.append({
-                "Name": raw_name or "",
-                "Phone_E164": e164,
-                "Country": country,
-                "Channel": channel,
-                "OptIn": optin
-            })
-
-    # Sort for sanity
-    cleaned.sort(key=lambda x: (x["Country"], x["Name"] or x["Phone_E164"]))
-
-    # Write output CSV ready for import to your sending pipeline
-    fieldnames = ["Name", "Phone_E164", "Country", "Channel", "OptIn"]
-    with open(OUTFILE, "w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        w.writerows(cleaned)
-
-    print(f"✅ Wrote {len(cleaned)} cleaned contacts -> {OUTFILE}")
+    print(f"✅ Wrote {len(out_rows)} cleaned contacts -> {out_path}")
 
 if __name__ == "__main__":
     main()
