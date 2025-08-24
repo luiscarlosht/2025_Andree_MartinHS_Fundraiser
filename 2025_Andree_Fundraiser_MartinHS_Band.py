@@ -6,6 +6,7 @@ import re
 import time
 import logging
 from datetime import datetime
+from collections import defaultdict
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 
@@ -15,40 +16,35 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 # ---------- Config / Env ----------
 FUNDRAISER_URL = os.getenv("FUNDRAISER_URL", "https://bit.ly/AndreeBand")
 GOAL_USD = os.getenv("GOAL_USD", "1000")
-DEADLINE = os.getenv("DEADLINE", "")            # e.g., "2025-09-30"
+DEADLINE = os.getenv("DEADLINE", "")              # e.g., "2025-09-30"
 PRIMARY_MODEL = os.getenv("OPENAI_PRIMARY_MODEL", "gpt-5")
 FALLBACK_MODEL = os.getenv("OPENAI_FALLBACK_MODEL", "gpt-5-mini")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("Missing OPENAI_API_KEY")
 
-# ---------- OpenAI client ----------
-from openai import OpenAI
-from openai import APIError, RateLimitError, APITimeoutError
-client = OpenAI(api_key=OPENAI_API_KEY)
+# Simple anti-spam controls (in-memory)
+RATE_WINDOW_SEC = int(os.getenv("RATE_WINDOW_SEC", "5"))   # min seconds between msgs per number
+DUP_WINDOW_SEC  = int(os.getenv("DUP_WINDOW_SEC", "10"))   # same text from same number within this window is ignored
 
-# ---------- Flask ----------
-app = Flask(__name__)
+_last_seen_ts = defaultdict(float)        # phone -> last timestamp
+_last_seen_msg = {}                       # (phone, text) -> timestamp
 
-@app.get("/health")
-def health():
-    return {
-        "ok": True,
-        "model_primary": PRIMARY_MODEL,
-        "model_fallback": FALLBACK_MODEL,
-        "fundraiser_url": FUNDRAISER_URL,
-        "goal_usd": GOAL_USD,
-        "deadline": DEADLINE,
-    }, 200
+def too_soon(phone: str) -> bool:
+    now = time.time()
+    if now - _last_seen_ts[phone] < RATE_WINDOW_SEC:
+        return True
+    _last_seen_ts[phone] = now
+    return False
 
-# ---------- Helpers ----------
-def is_spanish(text: str) -> bool:
-    t = text.lower()
-    spanish_markers = [
-        "¿", "¡", "qué", "como", "cómo", "cuánto", "cuanto", "dónde", "para qué", "para que",
-        "tarjeta", "mexicana", "donar", "donación", "pago", "ayudar", "compartir", "deducible"
-    ]
-    return any(w in t for w in spanish_markers)
+def is_duplicate(phone: str, text: str) -> bool:
+    key = (phone, (text or "").strip().lower())
+    now = time.time()
+    ts = _last_seen_msg.get(key, 0.0)
+    if now - ts < DUP_WINDOW_SEC:
+        return True
+    _last_seen_msg[key] = now
+    return False
 
 def fmt_deadline():
     if not DEADLINE:
@@ -61,15 +57,74 @@ def fmt_deadline():
 
 DEADLINE_HUMAN = fmt_deadline()
 
+def is_spanish(text: str) -> bool:
+    t = (text or "").lower()
+    spanish_markers = [
+        "¿", "¡", "qué", "como", "cómo", "cuánto", "cuanto", "dónde", "para qué", "para que",
+        "tarjeta", "mexicana", "donar", "donación", "pago", "ayudar", "compartir", "deducible"
+    ]
+    return any(w in t for w in spanish_markers)
+
+# ---------- OpenAI client ----------
+from openai import OpenAI
+from openai import APIError, RateLimitError, APITimeoutError
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+def ask_openai(prompt: str, max_retries: int = 2) -> str:
+    """
+    Try PRIMARY_MODEL first; on failure (quota, rate limit, transient), fall back to FALLBACK_MODEL.
+    Uses Responses API (no temperature).
+    """
+    models_to_try = [PRIMARY_MODEL, FALLBACK_MODEL]
+    last_err = None
+
+    for model in models_to_try:
+        for attempt in range(1, max_retries + 1):
+            try:
+                logging.info(f"[OpenAI] Using model={model}, attempt={attempt}")
+                resp = client.responses.create(model=model, input=prompt)
+                text = (resp.output_text or "").strip()
+                if not text:
+                    raise APIError("Empty response text")
+                if model != PRIMARY_MODEL:
+                    logging.warning(f"[OpenAI] FELL BACK to {model} and succeeded.")
+                return text
+            except (RateLimitError, APITimeoutError) as e:
+                backoff = min(8.0, 1.5 ** attempt)
+                logging.warning(f"[OpenAI] Transient error on {model}: {e}. Backing off {backoff:.1f}s")
+                time.sleep(backoff)
+                last_err = e
+                continue
+            except APIError as e:
+                logging.error(f"[OpenAI] API error on {model}: {e}. Will try fallback if available.")
+                last_err = e
+                break
+            except Exception as e:
+                logging.exception(f"[OpenAI] Unexpected error on {model}: {e}")
+                last_err = e
+                break
+
+    raise last_err or RuntimeError("OpenAI call failed without specific exception.")
+
+def build_prompt(user_text: str, sms: bool) -> str:
+    style = "very short (1–2 sentences)" if sms else "short (1–3 sentences)"
+    return f"""You are a friendly, concise, bilingual (English/Spanish) fundraising assistant.
+- Keep replies {style}.
+- If the user asks how to donate or is ready to help, include the donation link: {FUNDRAISER_URL}
+- If they greet or ask general info, explain it's for Andree Valentino (sophomore, French horn, Martin High School band) and funds support the band program.
+- Match the user's language: Spanish in Spanish, English in English.
+User: {user_text}
+Assistant:"""
+
 def faq_router(user_text: str, sms: bool = False) -> str | None:
     """
     Return a canned answer if we recognize the intent.
     If sms=True, use ultra-short (<=160 char) variants.
     """
-    txt = user_text.strip().lower()
+    txt = (user_text or "").strip().lower()
     es = is_spanish(txt)
 
-    # --- Patterns (EN & ES) ---
+    # Patterns (EN & ES)
     p_money_for = [
         r"\bwhat\s+is\s+the\s+money\s+for\b", r"\bwhat\s+is\s+it\s+for\b", r"\bpurpose\b",
         r"\bpara\s+qué\s+es\s+el\s+dinero\b", r"\bpara\s+que\s+es\s+el\s+dinero\b", r"\bpara\s+qué\s+es\b",
@@ -144,7 +199,7 @@ def faq_router(user_text: str, sms: bool = False) -> str | None:
                     if not es else f"¡Hola! Apoyamos la banda de Martin HS. Dona: {FUNDRAISER_URL}")
         return None
 
-    # ---- WHATSAPP (richer text) ----
+    # ---- WHATSApp (richer text) ----
     if match_any(p_money_for):
         return (
             f"Funds support the Martin HS band (equipment, uniforms, travel, and program needs). "
@@ -220,65 +275,42 @@ def faq_router(user_text: str, sms: bool = False) -> str | None:
 
     return None
 
-def ask_openai(prompt: str, max_retries: int = 2) -> str:
-    """
-    Try PRIMARY_MODEL first; on failure (quota, rate limit, transient), fall back to FALLBACK_MODEL.
-    (No temperature param for Responses API.)
-    """
-    models_to_try = [PRIMARY_MODEL, FALLBACK_MODEL]
-    last_err = None
+# ---------- Flask App ----------
+app = Flask(__name__)
 
-    for model in models_to_try:
-        for attempt in range(1, max_retries + 1):
-            try:
-                logging.info(f"[OpenAI] Using model={model}, attempt={attempt}")
-                resp = client.responses.create(model=model, input=prompt)
-                text = (resp.output_text or "").strip()
-                if not text:
-                    raise APIError("Empty response text")
-                if model != PRIMARY_MODEL:
-                    logging.warning(f"[OpenAI] FELL BACK to {model} and succeeded.")
-                return text
-            except (RateLimitError, APITimeoutError) as e:
-                backoff = min(8.0, 1.5 ** attempt)
-                logging.warning(f"[OpenAI] Transient error on {model}: {e}. Backing off {backoff:.1f}s")
-                time.sleep(backoff)
-                last_err = e
-                continue
-            except APIError as e:
-                logging.error(f"[OpenAI] API error on {model}: {e}. Will try fallback if available.")
-                last_err = e
-                break
-            except Exception as e:
-                logging.exception(f"[OpenAI] Unexpected error on {model}: {e}")
-                last_err = e
-                break
-    raise last_err or RuntimeError("OpenAI call failed without specific exception.")
+@app.get("/health")
+def health():
+    return {
+        "ok": True,
+        "model_primary": PRIMARY_MODEL,
+        "model_fallback": FALLBACK_MODEL,
+        "fundraiser_url": FUNDRAISER_URL,
+        "goal_usd": GOAL_USD,
+        "deadline": DEADLINE,
+        "rate_window_sec": RATE_WINDOW_SEC,
+        "dup_window_sec": DUP_WINDOW_SEC,
+    }, 200
 
-def build_prompt(user_text: str, sms: bool) -> str:
-    # Keep it brief for cost; allow the model to be concise. Slightly different instruction for SMS vs WhatsApp.
-    style = "very short (1–2 sentences)" if sms else "short (1–3 sentences)"
-    return f"""You are a friendly, concise, bilingual (English/Spanish) fundraising assistant.
-- Keep replies {style}.
-- If the user asks how to donate or is ready to help, include the donation link: {FUNDRAISER_URL}
-- If they greet or ask general info, explain it's for Andree Valentino (sophomore, French horn, Martin High School band) and funds support the band program.
-- Match the user's language: Spanish in Spanish, English in English.
-User: {user_text}
-Assistant:"""
-
-# ---------- Webhooks ----------
 @app.post("/whatsapp")
 def whatsapp_reply():
     form = request.form.to_dict()
     logging.info(f"[Webhook] Incoming WA form: {form}")
+
     incoming_msg = (form.get("Body") or "").strip()
+    from_num = (form.get("From") or "").replace("whatsapp:", "")
+
+    # rate / duplicate guard
+    if too_soon(from_num) or is_duplicate(from_num, incoming_msg):
+        logging.info(f"[RL] Skipping (rate/dup) from {from_num}")
+        resp = MessagingResponse()
+        return str(resp)
+
     resp = MessagingResponse()
     msg = resp.message()
     if not incoming_msg:
         msg.body("Hi! Please send a message to get started.")
         return str(resp)
 
-    # WhatsApp richer answers
     canned = faq_router(incoming_msg, sms=False)
     if canned:
         msg.body(canned)
@@ -297,14 +329,22 @@ def whatsapp_reply():
 def sms_reply():
     form = request.form.to_dict()
     logging.info(f"[Webhook] Incoming SMS form: {form}")
+
     incoming_msg = (form.get("Body") or "").strip()
+    from_num = (form.get("From") or "")
+
+    # rate / duplicate guard
+    if too_soon(from_num) or is_duplicate(from_num, incoming_msg):
+        logging.info(f"[RL] Skipping (rate/dup) from {from_num}")
+        resp = MessagingResponse()
+        return str(resp)
+
     resp = MessagingResponse()
     msg = resp.message()
     if not incoming_msg:
         msg.body("Hi! Please send a message to get started. Reply STOP to unsubscribe.")
         return str(resp)
 
-    # SMS short answers
     canned = faq_router(incoming_msg, sms=True)
     if canned:
         msg.body(canned)
@@ -313,7 +353,6 @@ def sms_reply():
     try:
         prompt = build_prompt(incoming_msg, sms=True)
         answer = ask_openai(prompt)
-        # (Optional) ensure we keep answers concise for SMS:
         if len(answer) > 160:
             answer = answer[:157] + "..."
         msg.body(answer)
