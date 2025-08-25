@@ -3,6 +3,7 @@
 
 import os
 import re
+import csv
 import time
 import logging
 from datetime import datetime
@@ -260,7 +261,7 @@ def faq_router(user_text: str, sms: bool = False) -> str | None:
             f"¡Gracias por apoyar! Abre este enlace, elige el monto que gustes y envía tu donación: {FUNDRAISER_URL}"
         )
     if match_any(p_share):
-        share_en = f"Hi! I’m supporting Andree’s Martin HS band fundraiser. Chip in here: {FUNDRAISER_URL}"
+        share_en = f"Hi! I’m supporting Andree’s Martin HS band fundraiser. Chip in here: {FUNDRAISERER_URL}"
         share_es = f"¡Hola! Apoyo la recaudación para la banda de Martin HS de Andree. Enlace: {FUNDRAISER_URL}"
         return (f"Yes, please share! You can copy this:\n\n{share_en}"
                 if not es else f"¡Sí, por favor comparte! Puedes copiar esto:\n\n{share_es}")
@@ -274,6 +275,19 @@ def faq_router(user_text: str, sms: bool = False) -> str | None:
         )
 
     return None
+
+# ---------- CSV status logger for Twilio delivery callbacks ----------
+STATUS_LOG = os.getenv("STATUS_LOG", "status_log.csv")
+
+def append_status(row: dict):
+    """Append one delivery status row to status_log.csv"""
+    want = ["timestamp","MessageSid","MessageStatus","ErrorCode","To","From","Channel"]
+    exists = os.path.exists(STATUS_LOG)
+    with open(STATUS_LOG, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=want)
+        if not exists:
+            w.writeheader()
+        w.writerow({k: row.get(k, "") for k in want})
 
 # ---------- Flask App ----------
 app = Flask(__name__)
@@ -290,6 +304,29 @@ def health():
         "rate_window_sec": RATE_WINDOW_SEC,
         "dup_window_sec": DUP_WINDOW_SEC,
     }, 200
+
+@app.post("/twilio/status")
+def twilio_status():
+    form = request.form.to_dict()
+    logging.info(f"[Status] {form}")
+
+    sid = form.get("MessageSid", "")
+    status = form.get("MessageStatus", "")  # queued/sent/delivered/undelivered/failed
+    err = form.get("ErrorCode", "") or ""
+    to_ = form.get("To", "")
+    frm = form.get("From", "")
+    channel = "whatsapp" if (frm and frm.startswith("whatsapp:")) else "sms"
+
+    append_status({
+        "timestamp": datetime.utcnow().isoformat(),
+        "MessageSid": sid,
+        "MessageStatus": status,
+        "ErrorCode": err,
+        "To": to_,
+        "From": frm,
+        "Channel": channel,
+    })
+    return ("", 204)
 
 @app.post("/whatsapp")
 def whatsapp_reply():
