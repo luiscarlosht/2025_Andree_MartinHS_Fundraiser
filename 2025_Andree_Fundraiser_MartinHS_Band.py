@@ -10,6 +10,7 @@ from datetime import datetime
 from collections import defaultdict
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
+from twilio.request_validator import RequestValidator
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -18,6 +19,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 FUNDRAISER_URL = os.getenv("FUNDRAISER_URL", "https://bit.ly/AndreeBand")
 GOAL_USD = os.getenv("GOAL_USD", "1000")
 DEADLINE = os.getenv("DEADLINE", "")              # e.g., "2025-09-30"
+
 PRIMARY_MODEL = os.getenv("OPENAI_PRIMARY_MODEL", "gpt-5")
 FALLBACK_MODEL = os.getenv("OPENAI_FALLBACK_MODEL", "gpt-5-mini")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -26,7 +28,7 @@ if not OPENAI_API_KEY:
 
 # Simple anti-spam controls (in-memory)
 RATE_WINDOW_SEC = int(os.getenv("RATE_WINDOW_SEC", "5"))   # min seconds between msgs per number
-DUP_WINDOW_SEC  = int(os.getenv("DUP_WINDOW_SEC", "10"))   # same text from same number within this window is ignored
+DUP_WINDOW_SEC  = int(os.getenv("DUP_WINDOW_SEC", "10"))   # ignore identical msg from same number within this window
 
 _last_seen_ts = defaultdict(float)        # phone -> last timestamp
 _last_seen_msg = {}                       # (phone, text) -> timestamp
@@ -200,7 +202,7 @@ def faq_router(user_text: str, sms: bool = False) -> str | None:
                     if not es else f"¡Hola! Apoyamos la banda de Martin HS. Dona: {FUNDRAISER_URL}")
         return None
 
-    # ---- WHATSApp (richer text) ----
+    # ---- WHATSAPP (richer text) ----
     if match_any(p_money_for):
         return (
             f"Funds support the Martin HS band (equipment, uniforms, travel, and program needs). "
@@ -261,7 +263,7 @@ def faq_router(user_text: str, sms: bool = False) -> str | None:
             f"¡Gracias por apoyar! Abre este enlace, elige el monto que gustes y envía tu donación: {FUNDRAISER_URL}"
         )
     if match_any(p_share):
-        share_en = f"Hi! I’m supporting Andree’s Martin HS band fundraiser. Chip in here: {FUNDRAISERER_URL}"
+        share_en = f"Hi! I’m supporting Andree’s Martin HS band fundraiser. Chip in here: {FUNDRAISER_URL}"
         share_es = f"¡Hola! Apoyo la recaudación para la banda de Martin HS de Andree. Enlace: {FUNDRAISER_URL}"
         return (f"Yes, please share! You can copy this:\n\n{share_en}"
                 if not es else f"¡Sí, por favor comparte! Puedes copiar esto:\n\n{share_es}")
@@ -276,18 +278,23 @@ def faq_router(user_text: str, sms: bool = False) -> str | None:
 
     return None
 
-# ---------- CSV status logger for Twilio delivery callbacks ----------
-STATUS_LOG = os.getenv("STATUS_LOG", "status_log.csv")
+# ---------- Delivery Status CSV + optional signature validation ----------
+STATUS_LOG = os.getenv("STATUS_LOG", "delivery_status.csv")
+TWILIO_VALIDATE = os.getenv("TWILIO_VALIDATE", "0") == "1"
+TWILIO_AUTH_TOKEN_ENV = os.getenv("TWILIO_AUTH_TOKEN")
+_validator = RequestValidator(TWILIO_AUTH_TOKEN_ENV) if (TWILIO_VALIDATE and TWILIO_AUTH_TOKEN_ENV) else None
 
-def append_status(row: dict):
-    """Append one delivery status row to status_log.csv"""
-    want = ["timestamp","MessageSid","MessageStatus","ErrorCode","To","From","Channel"]
+def append_status_csv(row: dict):
+    headers = [
+        "timestamp","sid","status","error_code","to","from","channel",
+        "num_segments","price","api_version"
+    ]
     exists = os.path.exists(STATUS_LOG)
     with open(STATUS_LOG, "a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=want)
+        w = csv.DictWriter(f, fieldnames=headers)
         if not exists:
             w.writeheader()
-        w.writerow({k: row.get(k, "") for k in want})
+        w.writerow({k: row.get(k, "") for k in headers})
 
 # ---------- Flask App ----------
 app = Flask(__name__)
@@ -305,28 +312,50 @@ def health():
         "dup_window_sec": DUP_WINDOW_SEC,
     }, 200
 
-@app.post("/twilio/status")
-def twilio_status():
+def _handle_status_webhook():
+    # Optional Twilio signature validation
+    if _validator is not None:
+        signature = request.headers.get("X-Twilio-Signature", "")
+        if not _validator.validate(request.url, request.form.to_dict(), signature):
+            logging.warning("[Status] Invalid Twilio signature")
+            return "Invalid signature", 403
+
     form = request.form.to_dict()
-    logging.info(f"[Status] {form}")
+    logging.info(f"[Status] Incoming: {form}")
 
-    sid = form.get("MessageSid", "")
-    status = form.get("MessageStatus", "")  # queued/sent/delivered/undelivered/failed
-    err = form.get("ErrorCode", "") or ""
-    to_ = form.get("To", "")
-    frm = form.get("From", "")
-    channel = "whatsapp" if (frm and frm.startswith("whatsapp:")) else "sms"
+    sid = form.get("MessageSid") or form.get("SmsSid") or ""
+    status = form.get("MessageStatus") or form.get("SmsStatus") or ""
+    error_code = form.get("ErrorCode") or ""
+    to_ = form.get("To") or ""
+    from_ = form.get("From") or ""
+    channel = "whatsapp" if to_.startswith("whatsapp:") or from_.startswith("whatsapp:") else "sms"
+    num_segments = form.get("NumSegments") or ""
+    price = form.get("Price") or ""
+    api_version = form.get("ApiVersion") or ""
 
-    append_status({
+    append_status_csv({
         "timestamp": datetime.utcnow().isoformat(),
-        "MessageSid": sid,
-        "MessageStatus": status,
-        "ErrorCode": err,
-        "To": to_,
-        "From": frm,
-        "Channel": channel,
+        "sid": sid,
+        "status": status,
+        "error_code": error_code,
+        "to": to_,
+        "from": from_,
+        "channel": channel,
+        "num_segments": num_segments,
+        "price": price,
+        "api_version": api_version,
     })
     return ("", 204)
+
+# Primary status callback
+@app.post("/status")
+def status_webhook():
+    return _handle_status_webhook()
+
+# Back-compat alias if you prefer this path in your Twilio config
+@app.post("/twilio/status")
+def status_webhook_alias():
+    return _handle_status_webhook()
 
 @app.post("/whatsapp")
 def whatsapp_reply():
@@ -399,4 +428,5 @@ def sms_reply():
     return str(resp)
 
 if __name__ == "__main__":
+    # Run Flask app
     app.run(host="0.0.0.0", port=5000)
