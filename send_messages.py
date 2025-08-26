@@ -5,20 +5,22 @@ from twilio.rest import Client
 
 # ============================ CONFIG (ENV / DEFAULTS) ============================
 
-# Status callback (your Flask /twilio/status endpoint)
 STATUS_CALLBACK_URL = os.getenv("STATUS_CALLBACK_URL", "")
 
-# From numbers
 DEFAULT_SMS_FROM = os.getenv("TWILIO_SMS_FROM", "")
-WA_FROM = os.getenv("TWILIO_WHATSAPP_FROM", "")  # e.g. "whatsapp:+14155238886"
+WA_FROM = os.getenv("TWILIO_WHATSAPP_FROM", "")
 
-# Twilio Content Template SIDs (recommended)
-# If provided, these will be used to send approved WhatsApp templates with variables.
-CONTENT_TEMPLATE_SID_ES = os.getenv("CONTENT_TEMPLATE_SID_ES", "")  # e.g. HXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
-CONTENT_TEMPLATE_SID_EN = os.getenv("CONTENT_TEMPLATE_SID_EN", "")
+# Twilio Content Template SIDs (support both naming styles)
+CONTENT_TEMPLATE_SID_ES = (
+    os.getenv("CONTENT_TEMPLATE_SID_ES")
+    or os.getenv("WA_CONTENT_SID_ES", "")
+)
+CONTENT_TEMPLATE_SID_EN = (
+    os.getenv("CONTENT_TEMPLATE_SID_EN")
+    or os.getenv("WA_CONTENT_SID_EN", "")
+)
 
 # Fallback approved body text (if you aren’t using Content Template SIDs)
-# Must exactly match your WhatsApp approved content, with {{name}} placeholder.
 WA_TEMPLATE_BODY_ES = os.getenv("WA_TEMPLATE_BODY_ES",
     "Hola {{name}} 👋 Soy Luis Carlos. Te invito a apoyar la recaudación de fondos de la banda de Martin HS. ¿Te puedo enviar el enlace?"
 )
@@ -26,37 +28,29 @@ WA_TEMPLATE_BODY_EN = os.getenv("WA_TEMPLATE_BODY_EN",
     "Hi {{name}} 👋 This is Luis Carlos. I’d like to invite you to support the Martin HS band fundraiser. Can I send you the link?"
 )
 
-# SMS body
 SMS_BODY = os.getenv("SMS_BODY",
     "Hi {name}, it’s Luis Carlos. We’re raising funds for Martin HS Band 🎺. "
     "Can I send you the link? Reply STOP to opt out."
 )
 
-# Rate pacing
 DELAY_SECONDS = float(os.getenv("DELAY_SECONDS", "0.7"))
-
-# CSV logs
 SENT_LOG  = os.getenv("SENT_LOG",  "sent_log.csv")
 ERROR_LOG = os.getenv("ERROR_LOG", "error_log.csv")
 
 # ===============================================================================
 
-
 def read_rows(path):
     with open(path, newline='', encoding='utf-8') as f:
         return list(csv.DictReader(f))
 
-
 def first_name(row):
-    # Prefer GreetingName, then FirstName, then Name, then "friend"
     return (row.get("GreetingName") or row.get("FirstName") or row.get("Name") or "friend").strip()
-
 
 def detect_language(row):
     """
     Returns 'ES' or 'EN'.
     Priority:
-      1) Row column 'Language' (ES/es/spanish, EN/en/english)
+      1) Row column 'Language'
       2) Country == MX -> ES, else EN
     """
     lang_raw = (row.get("Language") or row.get("language") or "").strip().lower()
@@ -70,14 +64,11 @@ def detect_language(row):
         return "ES"
     return "EN"
 
-
 def to_whatsapp_addr(e164):
     return f"whatsapp:{e164}"
 
-
 def now_iso():
     return datetime.datetime.utcnow().isoformat()
-
 
 def append_log(path, headers, row_dict):
     exists = os.path.exists(path)
@@ -87,10 +78,8 @@ def append_log(path, headers, row_dict):
             w.writeheader()
         w.writerow({k: row_dict.get(k, "") for k in headers})
 
-
 def personalize_body(template_text, name):
     return template_text.replace("{{name}}", name)
-
 
 # ------------------------------- Twilio senders -------------------------------
 
@@ -102,9 +91,7 @@ def send_sms(client, to, body, sms_from):
         status_callback=(STATUS_CALLBACK_URL or None)
     )
 
-
 def send_wa_text_body(client, to_wa, body, wa_from):
-    # Only valid inside 24h session if it’s not a template.
     return client.messages.create(
         to=to_wa,
         from_=wa_from,
@@ -112,12 +99,7 @@ def send_wa_text_body(client, to_wa, body, wa_from):
         status_callback=(STATUS_CALLBACK_URL or None)
     )
 
-
 def send_wa_content_template(client, to_wa, wa_from, content_sid, variables: dict):
-    """
-    Twilio Content API style template send.
-    variables must be a dict; Twilio expects content_variables as a JSON string.
-    """
     return client.messages.create(
         to=to_wa,
         from_=wa_from,
@@ -125,7 +107,6 @@ def send_wa_content_template(client, to_wa, wa_from, content_sid, variables: dic
         content_variables=json.dumps(variables),
         status_callback=(STATUS_CALLBACK_URL or None)
     )
-
 
 # ------------------------------- Main CLI logic -------------------------------
 
@@ -138,6 +119,8 @@ def main():
     ap.add_argument("--limit", type=int, default=None, help="Max rows to send")
     ap.add_argument("--dry-run", action="store_true", help="Print actions but do not send")
     ap.add_argument("--delay", type=float, default=DELAY_SECONDS, help="Seconds between sends")
+    ap.add_argument("--wa-lang", choices=["EN", "ES", "AUTO"], default="AUTO",
+                    help="Force WhatsApp template language (EN/ES). Default AUTO (MX→ES, else EN).")
     args = ap.parse_args()
 
     # Twilio client
@@ -152,16 +135,15 @@ def main():
     wa_from = WA_FROM
 
     if args.mode in ("WA", "WA_TEMPLATE") and not wa_from:
-        print("ERROR: Set TWILIO_WHATSAPP_FROM (e.g., whatsapp:+14155238886)", file=sys.stderr)
+        print("ERROR: Set TWILIO_WHATSAPP_FROM", file=sys.stderr)
         sys.exit(1)
     if args.mode == "SMS" and not sms_from:
-        print("ERROR: Set TWILIO_SMS_FROM (e.g., +12145550123)", file=sys.stderr)
+        print("ERROR: Set TWILIO_SMS_FROM", file=sys.stderr)
         sys.exit(1)
 
     rows = read_rows(args.csv_file)
     total = len(rows)
     sent = 0
-
     start = max(args.start_from, 0)
     end = total if args.limit is None else min(total, start + args.limit)
 
@@ -188,8 +170,9 @@ def main():
                          "phone": phone, "mode": "SMS", "body": body, "lang": ""})
 
             elif args.mode == "WA":
-                # Plain text WA (24h service window only)
                 lang = detect_language(row)
+                if args.wa_lang != "AUTO":
+                    lang = args.wa_lang
                 body = personalize_body(WA_TEMPLATE_BODY_ES if lang=="ES" else WA_TEMPLATE_BODY_EN, name)
                 to_wa = to_whatsapp_addr(phone)
                 if args.dry_run:
@@ -204,12 +187,13 @@ def main():
 
             elif args.mode == "WA_TEMPLATE":
                 lang = detect_language(row)
+                if args.wa_lang != "AUTO":
+                    lang = args.wa_lang
                 to_wa = to_whatsapp_addr(phone)
 
-                # Preferred path: use Content Template if SID is provided for the language
                 content_sid = CONTENT_TEMPLATE_SID_ES if lang == "ES" else CONTENT_TEMPLATE_SID_EN
                 if content_sid:
-                    variables = {"1": name}  # matches {{1}} in your template
+                    variables = {"1": name}
                     if args.dry_run:
                         print(f"[{idx}] WA TEMPLATE via Content ({lang}) to {to_wa} :: content_sid={content_sid} vars={variables}")
                     else:
@@ -218,9 +202,9 @@ def main():
                         append_log(SENT_LOG,
                             ["timestamp","sid","name","phone","mode","body","lang"],
                             {"timestamp": now_iso(), "sid": msg.sid, "name": row.get("Name",""),
-                             "phone": phone, "mode": "WA_TEMPLATE", "body": f"content_sid={content_sid} vars={variables}", "lang": lang})
+                             "phone": phone, "mode": "WA_TEMPLATE",
+                             "body": f"content_sid={content_sid} vars={variables}", "lang": lang})
                 else:
-                    # Fallback: send exact approved body text with {{name}} substituted
                     body = personalize_body(WA_TEMPLATE_BODY_ES if lang=="ES" else WA_TEMPLATE_BODY_EN, name)
                     if args.dry_run:
                         print(f"[{idx}] WA TEMPLATE (BODY) ({lang}) to {to_wa} :: {body}")
@@ -246,7 +230,6 @@ def main():
     print(f"Done. Attempted: {end-start}, Sent (no exception): {sent}")
     if args.dry_run:
         print("Dry run only — no messages were sent.")
-
 
 if __name__ == "__main__":
     main()
